@@ -2,9 +2,11 @@
 //
 // Idea in one paragraph: cbBTC trades in one-minute bars and the account is
 // long-only paper money, so the bot waits for a fast, deep sell-off, checks
-// that the fall has stopped accelerating, and buys the dip in one of two
-// sizes. Shallow washouts (about 1.2% under the recent peak) get half the
-// cash; deeper ones (about 1.8% under) get all of it. The deeper the dip,
+// that the fall has stopped accelerating, and buys the dip with all the
+// cash it has, at either of two depths. Shallow washouts (about 1.2% under
+// the recent peak) and deeper ones (about 1.8% under) both go all-in; what
+// differs between the tiers is the take-profit each one asks for. The
+// deeper the dip,
 // the smaller the bounce the bot asks for before taking profit, because the
 // take-profit fraction is a linear function of the dip depth recorded at
 // entry time. While holding, the position is closed by whichever comes
@@ -41,7 +43,7 @@ const STALL_SPAN = 4; // ... but no longer accelerating over this window
 const STALL_LIMIT = -0.002499; // 4-bar return below this means still falling
 const SHALLOW_DEPTH = 0.012031; // tier 1: at least this deep
 const DEEP_DEPTH = 0.017852; // tier 2: at least this deep
-const SHALLOW_FRACTION = 0.5; // tier 1 spends half the cash
+const SHALLOW_FRACTION = 1.0; // tier 1 goes all-in too: every qualifying dip spends all the cash
 const DEEP_FRACTION = 1; // tier 2 spends all of it
 const SHALLOW_TP_BASE = 0.009169;
 const SHALLOW_TP_SLOPE = 0.390676;
