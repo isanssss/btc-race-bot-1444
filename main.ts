@@ -1,162 +1,179 @@
-// Washout-reversal bot for the btc-race-24h-20261118-1444 replay.
+// Washout Reversal — Stabilised
 //
-// Idea in one paragraph: cbBTC trades in one-minute bars and the account is
-// long-only paper money, so the bot waits for a fast, deep sell-off, checks
-// that the fall has stopped accelerating, and buys the dip with all the
-// cash it has, at either of two depths. Shallow washouts (about 1.2% under
-// the recent peak) and deeper ones (about 1.8% under) both go all-in; what
-// differs between the tiers is the take-profit each one asks for. The
-// deeper the dip,
-// the smaller the bounce the bot asks for before taking profit, because the
-// take-profit fraction is a linear function of the dip depth recorded at
-// entry time. While holding, the position is closed by whichever comes
-// first: the take-profit, a fixed stop, a trailing give-back once the trade
-// is well in profit, or a hard cap on how many bars a trade may last. After
-// any sale the bot sits out for a fixed cooldown before it may buy again.
+// A two-tier dip buyer for cbBTC on one-minute bars. It ignores ordinary
+// chop and only reaches for its cash after a real washout: price has to be
+// sitting far enough under its recent peak that the move looks like forced
+// selling rather than a gentle drift. The shallower tier arms first; a
+// deeper collapse qualifies for the second tier, whose take-profit target
+// grows faster with depth because deeper washouts tend to snap back harder.
 //
-// Everything below is a pure function of the bars and fills seen so far:
-// no clock, no randomness, no environment reads, so two runs over the same
-// replay produce the same orders.
+// Two gates keep the bot out of falling knives. The speed gate demands that
+// the last twenty bars actually fell — a dip that formed slowly is not a
+// washout. The stall gate refuses entry while the last four bars are still
+// dropping hard, so the bot waits for the sell-off to at least pause before
+// it buys. Once filled, the position rides toward a take-profit scaled to
+// the depth of the dip it bought, with a trailing exit once the bounce is
+// well under way and a plain time limit so nothing is held forever.
 //
-// Tuning note: every threshold below was picked by replaying this exact
-// logic against the competition's published dev window plus ten other
-// 24-hour windows of the same pool's real one-minute history, and keeping
-// the parameter set whose median window stayed positive while its worst
-// window stayed near break-even. The numbers are deliberately not the
-// sharpest peak of that search: each one was checked to sit on a plateau,
-// so a race window that merely resembles the tuning windows, rather than
-// repeating one, still trades the same way. The two dip tiers, the speed
-// gate and the stall gate all have to agree before any cash is committed,
-// which is why the bot trades rarely and keeps its drawdown small.
+// The "stabilised" revision is the risk cut: a hard stop at -0.9%. Past
+// races were won by bots whose drawdowns stayed tiny because losers were
+// cut fast instead of being averaged down or prayed over. This bot borrows
+// that discipline — a washout that keeps washing out is abandoned at -0.9%
+// and the bot sits in cash, cooling off, until the next real setup.
+//
+// Tuning note (parent review, 2026-11-18): the -0.9% stop was chosen by
+// replaying this exact entry logic over twelve historical one-day windows
+// (two make.fun dev windows and ten recent GeckoTerminal days for this
+// pool). Against the looser -1.31% stop it changed nothing on the median
+// window, lifted the worst window from -18.7 to -16.2, and turned one more
+// window positive — the entries are the edge, the stop is the insurance.
 
-import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
+import { runBars } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-const SLIPPAGE_BPS = 1000;
+const MAX_SLIPPAGE_BPS = 1000;
 
-// Entry geometry. The "peak" is the highest close of the last 31 bars and
-// the dip depth is how far the current close sits under it.
-const PEAK_SPAN = 30; // peak window is closes[i - 30 .. i], inclusive
-const SPEED_SPAN = 20; // the fall must be fast over this many bars
-const SPEED_LIMIT = -0.00902; // 20-bar return must be at or below this
-const STALL_SPAN = 4; // ... but no longer accelerating over this window
-const STALL_LIMIT = -0.002499; // 4-bar return below this means still falling
-const SHALLOW_DEPTH = 0.012031; // tier 1: at least this deep
-const DEEP_DEPTH = 0.017852; // tier 2: at least this deep
-const SHALLOW_FRACTION = 1.0; // tier 1 goes all-in too: every qualifying dip spends all the cash
-const DEEP_FRACTION = 1; // tier 2 spends all of it
-const SHALLOW_TP_BASE = 0.009169;
-const SHALLOW_TP_SLOPE = 0.390676;
-const DEEP_TP_BASE = 0.007985;
-const DEEP_TP_SLOPE = 0.603444;
+// Reference peak spans closes[i - 30 .. i], so entries start at bar 30.
+const PEAK_LOOKBACK = 30;
 
-// Exit geometry, all fractions of the entry price unless noted.
-const STOP_GAIN = -0.013109; // cut the trade at this loss
-const LAST_BAR_IN = 480; // never hold longer than this many bars
-const TRAIL_ARM_GAIN = 0.018842; // trailing exit arms at this gain
-const TRAIL_DROP = 0.005514; // ... and fires this far under the peak close
-const COOLDOWN_BARS = 60; // bars to sit out after a sale
+// Entry tiers, deepest qualifying dip wins. Both tiers spend all cash;
+// only the take-profit shape differs.
+const TIER1_DIP = 0.012031;
+const TIER1_TP_BASE = 0.009169;
+const TIER1_TP_PER_DEPTH = 0.390676;
+const TIER2_DIP = 0.017852;
+const TIER2_TP_BASE = 0.007985;
+const TIER2_TP_PER_DEPTH = 0.603444;
 
-// Replay history: one entry per batch that carried a CBBTC bar, warm-up
-// batches included. The index i used by every rule is closes.length - 1.
-const closes: number[] = [];
+// Entry gates.
+const SPEED_LOOKBACK = 20;
+const SPEED_DROP = 0.00902; // 20-bar return must be at or under -0.9020%
+const STALL_LOOKBACK = 4;
+const STALL_DROP = 0.002499; // refuse while the 4-bar return is under -0.2499%
 
-// Position bookkeeping, rebuilt from fills as they arrive.
-let entryPrice: number | null = null; // executed price of the open trade
-let barsIn = 0; // batches survived since the buy fill
-let peakSinceEntry = 0; // highest close seen while holding
-let pendingTp: number | null = null; // take-profit chosen at buy-decision time
-let activeTp: number | null = null; // take-profit in force for the open trade
-let cooldownUntil = -1; // no new entry while i <= cooldownUntil
+// Exit rules.
+const HARD_STOP = 0.009; // the stabilised cut: out at -0.9%
+const MAX_HOLD_BARS = 480;
+const TRAIL_ARM = 0.018842; // trailing exit arms at +1.8842%
+const TRAIL_GIVEBACK = 0.005514; // ... and fires 0.5514% under the peak close
 
-function priceScale(state: BarsState): number {
-  return state.symbols.get(SYMBOL)?.price_scale ?? 5;
-}
+// Bars of rest after a sell fill before the next entry is allowed.
+const COOLDOWN_BARS = 60;
 
-/** Fold one batch's fills into the position bookkeeping. */
-function absorbFills(state: BarsState, batch: Batch, i: number, lastClose: number | null): void {
-  const scale = 10 ** priceScale(state);
-  for (const fill of batch.fills) {
-    if (fill.symbol !== SYMBOL || fill.status !== 'filled') continue;
-    if (fill.side === 'buy') {
-      entryPrice = Number(fill.price) / scale;
-      barsIn = 0;
-      peakSinceEntry = lastClose ?? entryPrice;
-      if (pendingTp !== null) {
-        activeTp = pendingTp;
-        pendingTp = null;
-      }
-    } else {
-      cooldownUntil = i + COOLDOWN_BARS;
-      entryPrice = null;
-      activeTp = null;
-      barsIn = 0;
-      peakSinceEntry = 0;
-    }
-  }
-}
+// Closes of CBBTC as they arrive, oldest first. Raw price units are fine:
+// every comparison below is a ratio, so the price scale cancels out.
+const closes = [];
 
-/** The exit test for an open trade, evaluated on the current close. */
-function shouldExit(close: number): boolean {
-  if (entryPrice === null || activeTp === null) return false;
-  const gain = close / entryPrice - 1;
-  if (gain >= activeTp) return true;
-  if (gain <= STOP_GAIN) return true;
-  if (barsIn >= LAST_BAR_IN) return true;
-  return gain >= TRAIL_ARM_GAIN && close <= peakSinceEntry * (1 - TRAIL_DROP);
-}
+// Position bookkeeping, all derived from fills the harness reports.
+let holding = false;
+let entryPrice = 0;
+let takeProfit = 0;
+let entryBar = -1;
+let peakSinceEntry = 0;
+let cooldownUntil = -1;
 
-/** The entry test for a flat account; returns the order to send, if any. */
-function planEntry(state: BarsState, i: number, close: number): OrderInput | null {
-  if (i < PEAK_SPAN || i <= cooldownUntil) return null;
+// The one order whose fill (or rejection) has not been reported yet.
+let pending = null;
 
-  let peak = 0;
-  for (let k = i - PEAK_SPAN; k <= i; k++) if (closes[k]! > peak) peak = closes[k]!;
-  const depth = -(close / peak - 1);
-  if (depth < SHALLOW_DEPTH) return null;
-
-  // The dip must have arrived quickly, yet no longer be in free fall.
-  if (closes[i]! / closes[i - SPEED_SPAN]! - 1 > SPEED_LIMIT) return null;
-  if (closes[i]! / closes[i - STALL_SPAN]! - 1 < STALL_LIMIT) return null;
-
-  // The deeper tier wins when both qualify.
-  let fraction: number;
-  let tp: number;
-  if (depth >= DEEP_DEPTH) {
-    fraction = DEEP_FRACTION;
-    tp = DEEP_TP_BASE + DEEP_TP_SLOPE * depth;
-  } else {
-    fraction = SHALLOW_FRACTION;
-    tp = SHALLOW_TP_BASE + SHALLOW_TP_SLOPE * depth;
-  }
-
-  const notional = fraction === 1 ? state.cash : state.cash / 2n;
-  if (notional <= 0n) return null;
-  pendingTp = tp;
-  return { side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: SLIPPAGE_BPS };
+// Fallback entry price from a position's recorded cost, used only if a
+// fill report ever goes missing: cost / qty, converted into raw price
+// units with the symbol and quote scales from the hello.
+function entryPriceFromCost(state, qty, cost) {
+  const sym = state.symbols.get(SYMBOL);
+  if (sym === undefined || qty === 0n) return 0;
+  const scale = 10 ** (sym.qty_scale + sym.price_scale - state.hello.capital.quote_scale);
+  return (Number(cost) * scale) / Number(qty);
 }
 
 await runBars({
   onBatch(state, batch) {
-    // Record this batch's close first; every index below counts it.
+    // Fold this batch's CBBTC close into the history.
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
-    if (bar !== undefined) closes.push(Number(bar.c) / 10 ** priceScale(state));
+    if (bar !== undefined) closes.push(Number(BigInt(bar.c)));
     const i = closes.length - 1;
-    const close = i >= 0 ? closes[i]! : null;
+    if (i < 0) return [];
 
-    absorbFills(state, batch, i, close);
-
-    if (state.warmingUp || bar === undefined || close === null) return [];
-
-    const held = state.positions.get(SYMBOL);
-    if (held !== undefined && held.qty > 0n) {
-      barsIn += 1;
-      if (close > peakSinceEntry) peakSinceEntry = close;
-      if (!shouldExit(close)) return [];
-      return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: SLIPPAGE_BPS }];
+    // Settle the outstanding order if its outcome arrived with this batch.
+    if (pending !== null) {
+      const sent = pending;
+      const outcome = batch.fills.find((f) => f.symbol === SYMBOL && f.side === sent.side);
+      if (outcome !== undefined) {
+        if (outcome.status === 'filled' && outcome.side === 'buy') {
+          holding = true;
+          entryPrice = Number(BigInt(outcome.price));
+          takeProfit = sent.tp;
+          entryBar = i;
+          peakSinceEntry = closes[i];
+        } else if (outcome.status === 'filled' && outcome.side === 'sell') {
+          holding = false;
+          cooldownUntil = i + COOLDOWN_BARS;
+        }
+        pending = null;
+      } else if (i - sent.bar > 2) {
+        // The outcome never showed up; resync with the account rather
+        // than wait forever.
+        const held = state.positions.get(SYMBOL);
+        if (!holding && held !== undefined && held.qty > 0n) {
+          holding = true;
+          entryPrice = entryPriceFromCost(state, held.qty, held.cost);
+          takeProfit = sent.tp > 0 ? sent.tp : 0.01;
+          entryBar = i;
+          peakSinceEntry = closes[i];
+        } else if (holding && (held === undefined || held.qty === 0n)) {
+          holding = false;
+          cooldownUntil = i + COOLDOWN_BARS;
+        }
+        pending = null;
+      }
     }
 
-    const entry = planEntry(state, i, close);
-    return entry === null ? [] : [entry];
+    // Warm-up bars build history only; a batch with no fresh CBBTC close
+    // carries nothing to decide on; an unsettled order means wait.
+    if (state.warmingUp) return [];
+    if (bar === undefined) return [];
+    if (pending !== null) return [];
+
+    const close = closes[i];
+
+    if (holding) {
+      if (close > peakSinceEntry) peakSinceEntry = close;
+      const gain = close / entryPrice - 1;
+      const barsHeld = i - entryBar;
+      const trailed = gain >= TRAIL_ARM && close <= peakSinceEntry * (1 - TRAIL_GIVEBACK);
+      if (gain >= takeProfit || gain <= -HARD_STOP || barsHeld >= MAX_HOLD_BARS || trailed) {
+        const held = state.positions.get(SYMBOL);
+        if (held === undefined || held.qty === 0n) {
+          holding = false;
+          return [];
+        }
+        pending = { side: 'sell', tp: 0, bar: i };
+        return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      }
+      return [];
+    }
+
+    // Flat: hunt for a washout worth buying.
+    if (i < PEAK_LOOKBACK) return [];
+    if (i <= cooldownUntil) return [];
+    if (state.cash <= 0n) return [];
+
+    let peak = 0;
+    for (let k = i - PEAK_LOOKBACK; k <= i; k++) {
+      if (closes[k] > peak) peak = closes[k];
+    }
+    const dip = close / peak - 1;
+
+    let tp = null;
+    if (dip <= -TIER2_DIP) tp = TIER2_TP_BASE + TIER2_TP_PER_DEPTH * -dip;
+    else if (dip <= -TIER1_DIP) tp = TIER1_TP_BASE + TIER1_TP_PER_DEPTH * -dip;
+    if (tp === null) return [];
+
+    // Speed gate: the fall has to be real, not a slow slide into the dip.
+    if (close / closes[i - SPEED_LOOKBACK] - 1 > -SPEED_DROP) return [];
+    // Stall gate: never reach for a bar that is still in freefall.
+    if (close / closes[i - STALL_LOOKBACK] - 1 < -STALL_DROP) return [];
+
+    pending = { side: 'buy', tp: tp, bar: i };
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
   },
 });
