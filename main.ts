@@ -15,6 +15,17 @@
 // Everything below is a pure function of the bars and fills seen so far:
 // no clock, no randomness, no environment reads, so two runs over the same
 // replay produce the same orders.
+//
+// Tuning note: every threshold below was picked by replaying this exact
+// logic against the competition's published dev window plus ten other
+// 24-hour windows of the same pool's real one-minute history, and keeping
+// the parameter set whose median window stayed positive while its worst
+// window stayed near break-even. The numbers are deliberately not the
+// sharpest peak of that search: each one was checked to sit on a plateau,
+// so a race window that merely resembles the tuning windows, rather than
+// repeating one, still trades the same way. The two dip tiers, the speed
+// gate and the stall gate all have to agree before any cash is committed,
+// which is why the bot trades rarely and keeps its drawdown small.
 
 import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
 
